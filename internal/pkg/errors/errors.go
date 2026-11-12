@@ -1,5 +1,7 @@
 package errors
 
+import stderrors "errors"
+
 const (
 	CodeSuccess            = 0
 	CodeBadRequest         = 1001
@@ -99,13 +101,42 @@ func InternalError(message string) *AppError {
 }
 
 func IsAppError(err error) bool {
-	_, ok := err.(*AppError)
-	return ok
+	var appErr *AppError
+	return stderrors.As(err, &appErr)
 }
 
 func GetErrorCode(err error) int {
-	if appErr, ok := err.(*AppError); ok {
+	var appErr *AppError
+	if stderrors.As(err, &appErr) {
 		return appErr.Code
 	}
 	return CodeInternalError
+}
+
+// HTTPStatusOf 把业务错误码映射为 HTTP 状态码。
+// 未收录的非成功码按内部错误处理（fail-loud），
+// 避免业务错误全部以 HTTP 200 逃过监控、网关与客户端的重试/分流逻辑。
+func HTTPStatusOf(code int) int {
+	switch code {
+	case CodeSuccess:
+		return 200
+	case CodeBadRequest:
+		return 400
+	case CodeUnauthorized:
+		return 401
+	case CodeForbidden:
+		return 403
+	case CodeNotFound:
+		return 404
+	case CodeConflict:
+		return 409
+	case CodeInternalError:
+		return 500
+	case CodeServiceUnavailable:
+		return 503
+	case CodeTooManyRequests:
+		return 429
+	default:
+		return 500
+	}
 }
