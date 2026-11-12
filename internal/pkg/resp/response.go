@@ -36,10 +36,7 @@ func SuccessWithMessage(c *app.RequestContext, message string, data interface{})
 }
 
 func Error(c *app.RequestContext, code int) {
-	httpStatus := consts.StatusOK
-	if code == errors.CodeUnauthorized {
-		httpStatus = consts.StatusUnauthorized
-	}
+	httpStatus := errors.HTTPStatusOf(code)
 	c.JSON(httpStatus, Response{
 		Code:    code,
 		Message: errors.GetMessage(code),
@@ -47,10 +44,7 @@ func Error(c *app.RequestContext, code int) {
 }
 
 func ErrorWithMessage(c *app.RequestContext, code int, message string) {
-	httpStatus := consts.StatusOK
-	if code == errors.CodeUnauthorized {
-		httpStatus = consts.StatusUnauthorized
-	}
+	httpStatus := errors.HTTPStatusOf(code)
 	c.JSON(httpStatus, Response{
 		Code:    code,
 		Message: message,
@@ -58,10 +52,7 @@ func ErrorWithMessage(c *app.RequestContext, code int, message string) {
 }
 
 func ErrorWithData(c *app.RequestContext, code int, message string, data interface{}) {
-	httpStatus := consts.StatusOK
-	if code == errors.CodeUnauthorized {
-		httpStatus = consts.StatusUnauthorized
-	}
+	httpStatus := errors.HTTPStatusOf(code)
 	c.JSON(httpStatus, Response{
 		Code:    code,
 		Message: message,
