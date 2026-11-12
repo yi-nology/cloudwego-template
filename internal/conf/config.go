@@ -1,7 +1,11 @@
 package conf
 
 import (
+	"bytes"
 	"fmt"
+	"os"
+	"reflect"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -74,44 +78,120 @@ type AppConfig struct {
 
 var GlobalConfig *Config
 
+// envKeyReplacer 让 viper 的键（如 database.password）能匹配上
+// 下划线形态的环境变量（DATABASE_PASSWORD）。
+var envKeyReplacer = strings.NewReplacer(".", "_")
+
 func Init(configPath string) error {
-	viper.SetConfigFile(configPath)
-	viper.SetConfigType("yaml")
-
-	viper.AutomaticEnv()
-
-	if err := viper.ReadInConfig(); err != nil {
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
 		return fmt.Errorf("failed to read config file: %w", err)
 	}
 
+	v := newEnvAwareViper()
+	if err := v.ReadConfig(bytes.NewReader(expandEnvRefs(raw))); err != nil {
+		return fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	return decode(v)
+}
+
+func InitWithDefault() error {
+	v := newEnvAwareViper()
+
+	v.SetDefault("server.host", "0.0.0.0")
+	v.SetDefault("server.port", 8888)
+	v.SetDefault("server.mode", "debug")
+	v.SetDefault("server.read_timeout", 30)
+	v.SetDefault("server.write_timeout", 30)
+	v.SetDefault("database.driver", "sqlite")
+	v.SetDefault("database.db_name", "./data/app.db")
+	v.SetDefault("log.level", "info")
+	v.SetDefault("log.max_size", 100)
+	v.SetDefault("log.max_backups", 10)
+	v.SetDefault("log.max_age", 30)
+	v.SetDefault("log.compress", true)
+	v.SetDefault("app.name", "template")
+	v.SetDefault("app.version", "1.0.0")
+
+	return decode(v)
+}
+
+// newEnvAwareViper 构造接好环境变量覆盖链的 viper 实例：
+// 环境变量（最高）> 配置文件 > 代码默认值。
+// 每次使用独立实例，避免包级 viper 全局状态在测试/多次 Init 间互相污染。
+func newEnvAwareViper() *viper.Viper {
+	v := viper.New()
+	v.SetConfigType("yaml")
+	v.SetEnvKeyReplacer(envKeyReplacer)
+	v.AutomaticEnv()
+	return v
+}
+
+// decode 绑定全部已知配置键的环境变量并解出 GlobalConfig。
+// viper.Unmarshal 基于 AllKeys()，AutomaticEnv 的键不在其中，
+// 所以必须显式 BindEnv：YAML 里没出现、只在环境变量里给的配置项
+// （如 DATABASE_SSL_MODE）才能进得来。
+func decode(v *viper.Viper) error {
+	bindStructEnvs(v, "", &Config{})
+
+	// 文档（README/REDIS.md）承诺的短名别名
+	_ = v.BindEnv("database.password", "DB_PASSWORD")
+	_ = v.BindEnv("redis.password", "REDIS_PASSWORD")
+
 	GlobalConfig = &Config{}
-	if err := viper.Unmarshal(GlobalConfig); err != nil {
+	if err := v.Unmarshal(GlobalConfig); err != nil {
 		return fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
 	return nil
 }
 
-func InitWithDefault() error {
-	viper.SetDefault("server.host", "0.0.0.0")
-	viper.SetDefault("server.port", 8888)
-	viper.SetDefault("server.mode", "debug")
-	viper.SetDefault("server.read_timeout", 30)
-	viper.SetDefault("server.write_timeout", 30)
-	viper.SetDefault("database.driver", "sqlite")
-	viper.SetDefault("database.db_name", "./data/app.db")
-	viper.SetDefault("log.level", "info")
-	viper.SetDefault("log.max_size", 100)
-	viper.SetDefault("log.max_backups", 10)
-	viper.SetDefault("log.max_age", 30)
-	viper.SetDefault("log.compress", true)
-	viper.SetDefault("app.name", "template")
-	viper.SetDefault("app.version", "1.0.0")
-
-	GlobalConfig = &Config{}
-	if err := viper.Unmarshal(GlobalConfig); err != nil {
-		return fmt.Errorf("failed to unmarshal config: %w", err)
+// bindStructEnvs 按 mapstructure 标签递归遍历配置结构体，
+// 为每个叶子键 BindEnv，保证「YAML 未出现的键也能从环境变量取值」。
+// in 必须传入可寻址的结构体（指针或其字段地址）。
+func bindStructEnvs(v *viper.Viper, prefix string, in any) {
+	rv := reflect.Indirect(reflect.ValueOf(in))
+	if rv.Kind() != reflect.Struct {
+		return
 	}
+	rt := rv.Type()
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		tag := f.Tag.Get("mapstructure")
+		if tag == "" {
+			continue
+		}
+		key := tag
+		if prefix != "" {
+			key = prefix + "." + key
+		}
+		switch {
+		case f.Type.Kind() == reflect.Struct:
+			bindStructEnvs(v, key, rv.Field(i).Addr().Interface())
+		case f.Type.Kind() == reflect.Pointer && f.Type.Elem().Kind() == reflect.Struct:
+			bindStructEnvs(v, key, reflect.New(f.Type.Elem()).Interface())
+		default:
+			_ = v.BindEnv(key)
+		}
+	}
+}
 
-	return nil
+// expandEnvRefs 展开 YAML 中的 ${VAR} / $VAR 环境变量引用
+// （README「生产配置建议」与 REDIS.md 承诺的 ${DB_PASSWORD} 写法）。
+// 未定义的引用原样保留，避免值被静默置空；$$、$1 等 shell 特殊语法不受影响。
+func expandEnvRefs(data []byte) []byte {
+	return []byte(os.Expand(string(data), func(name string) string {
+		if isShellSpecialVar(name) {
+			return "$" + name
+		}
+		if val, ok := os.LookupEnv(name); ok {
+			return val
+		}
+		return "${" + name + "}"
+	}))
+}
+
+func isShellSpecialVar(name string) bool {
+	return len(name) == 1 && strings.ContainsAny(name, "*#$@!?-0123456789")
 }
